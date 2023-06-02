@@ -226,6 +226,173 @@ function New-PfaRdm {
         throw $PSItem
     }
 }
+function Add-PfaExistingVolRdm {
+  <#
+  .SYNOPSIS
+    Creates a Raw Device Mapping for a VM with an existing Pure volume
+  .DESCRIPTION
+    Gets an existing volume on a FlashArray and presents it to a VM as a RDM.
+  .INPUTS
+    FlashArray connection, volume name, virtual machine, SCSI adapter.
+  .OUTPUTS
+    FlashArray volume name
+  .NOTES
+    Version:        2.0
+    Author:         Luke Roberts
+    Creation Date:  06/02/2023
+  .EXAMPLE
+    PS C:\ $faCreds = get-credential
+    PS C:\ New-PfaConnection -endpoint flasharray-m20-2 -credentials $faCreds -defaultArray
+    PS C:\ $vm = get-vm myVM
+    PS C:\ New-PfaRDM -vm $vm -volName MYPUREVOLNAME
+
+    Creates RDM pointer to existing pure vol and attaches to VM
+  
+  *******Disclaimer:******************************************************
+  This scripts are offered "as is" with no warranty.  While this 
+  scripts is tested and working in my environment, it is recommended that you test 
+  this script in a test lab before using in a production environment. Everyone can 
+  use the scripts/commands provided here without any written permission but I
+  will not be liable for any damage or loss to the system.
+  ************************************************************************
+  #>
+
+  [CmdletBinding()]
+  Param(
+          [Parameter(Position=0,ValueFromPipeline=$True)]
+          [PurePowerShell.PureArray]$Flasharray,
+
+          [Parameter(Position=1,mandatory=$true,ValueFromPipeline=$True)]
+          [VMware.VimAutomation.ViCore.Types.V1.Inventory.VirtualMachine]$Vm,
+
+          [Parameter(Position=2,mandatory=$true)]
+          [string]$VolName,
+
+          [ValidateScript({
+            if ($_.Type -ne 'VMFS')
+            {
+                throw "The entered datastore is not a VMFS datastore. It is type $($_.Type). Please only enter a VMFS datastore"
+            }
+            else {
+              $true
+            }
+          })]
+          [Parameter(Position=5,ValueFromPipeline=$True)]
+          [VMware.VimAutomation.ViCore.Types.V1.DatastoreManagement.Datastore]$Datastore,
+
+          [Parameter(Position=6,ValueFromPipeline=$True)]
+          [VMware.VimAutomation.ViCore.Types.V1.VirtualDevice.ScsiController]$ScsiController
+  )
+  $warningpreference = "SilentlyContinue"
+  if ($null -eq $flasharray)
+  {
+    $flasharray = checkDefaultFlashArray
+  }
+  $ErrorActionPreference = "stop"
+  if ($null -eq $datastore)
+  {
+      $vmDatastore = Get-Datastore -vm $vm
+      if ($vmDatastore.count -gt 1)
+      {
+          $ds = get-datastore (($vm.ExtensionData.Layoutex.file |where-object {$_.name -like "*.vmx*"}).name.split("]")[0].substring(1))
+          if ($ds.Type -ne 'VMFS')
+          {
+              throw "The home datastore for this VM (a datastore named $($ds.name)) is not a VMFS datastore. It is type $($ds.Type). Please pass in a target VMFS datastore for the RDM pointer file."
+          }
+          else {
+            $datastore = $ds
+          }
+      }
+      else {
+          $datastore = $vmDatastore[0]
+      }
+  }
+  $cluster = $vm | get-cluster
+  if ($null -eq $cluster)
+  {
+      throw "This VM is not on a host in a cluster. Non-clustered hosts are not supported by this script."
+  }
+  $hostGroup = $cluster | get-pfaHostGroupfromVcCluster -flasharray $flasharray -ErrorAction Stop
+  $newVol = New-PfaRestOperation -resourceType "volume/$($volName)" -restOperationType GET -flasharray $flasharray -SkipCertificateCheck -ErrorAction Stop
+  New-PfaRestOperation -resourceType "hgroup/$($hostGroup.name)/volume/$($newVol.name)" -restOperationType POST -flasharray $flasharray -SkipCertificateCheck -ErrorAction Stop |Out-Null
+  $esxiHosts = $cluster| Get-VMHost 
+  foreach ($esxiHost in $esxiHosts)
+  {
+      $esxi = $esxiHost.ExtensionData
+      $storageSystem = Get-View -Id $esxi.ConfigManager.StorageSystem
+      $hbas = ($esxihost |Get-VMHostHba |where-object {$_.Type -eq "FibreChannel" -or $_.Type -eq "iSCSI"}).device
+      foreach ($hba in $hbas) {
+          $storageSystem.rescanHba($hba)
+      }
+  }
+  $newNAA =  "naa.624a9370" + $newVol.serial.toLower()
+  foreach ($esxiHost in $esxiHosts)
+  {
+    $esxcli = Get-EsxCli -VMHost $ESXiHost -V2
+    $args1 =  $esxcli.storage.core.device.setconfig.CreateArgs()
+    $args1.device = $newNAA
+    $args1.perenniallyreserved = $true
+    $esxcli.storage.core.device.setconfig.Invoke($args1)
+  }
+  if($null -eq $scsiController)
+  {
+      $controller = $vm |Get-ScsiController 
+      if ($controller.count -gt 1)
+      {
+          $pvSCSIs = $vm |Get-ScsiController |Where-Object {$_.Type -eq "ParaVirtual"}
+          if ($pvSCSIs.count -gt 1)
+          {
+              $pvDisksHigh = 1000
+              foreach ($pvSCSI in $pvSCSIs)
+              {
+                  $pvDisks = ($vm | Get-HardDisk | Where-Object {$_.ExtensionData.ControllerKey -eq $pvSCSI.key}).count
+                  if ($pvDisksHigh -ge $pvDisks)
+                  {
+                      $pvDisksHigh = $pvDisks
+                      $controller = $pvSCSI
+                  }
+              }
+          }
+          elseif ($pvSCSIs.count -eq 1)
+          {
+              $controller = $pvSCSIs
+          }
+          else 
+          {
+              $lsiSCSIs = $vm |Get-ScsiController
+              if ($lsiSCSIs.count -gt 1)
+              {
+                  $lsiDisksHigh = 1000
+                  foreach ($lsiSCSI in $lsiSCSIs)
+                  {
+                      $lsiDisks = ($vm | Get-HardDisk | Where-Object {$_.ExtensionData.ControllerKey -eq $lsiSCSI.key}).count
+                      if ($lsiDisksHigh -ge $lsiDisks)
+                      {
+                          $lsiDisksHigh = $lsiDisks
+                          $controller = $lsiSCSI
+                      }
+                  }
+              }
+              else
+              {
+                  $controller = $lsiSCSIs
+              }
+          }
+      }
+  } 
+  else {
+      $controller = $scsiController
+  }
+  try {
+      $vm | new-harddisk -DeviceName "/vmfs/devices/disks/$($newNAA)" -DiskType RawPhysical -Controller $controller -Datastore $datastore -ErrorAction stop |Out-Null
+      $rdmDisk = $vm |Get-harddisk |where-object {$_.DiskType -eq "RawPhysical"}|  where-object {$null -ne $_.extensiondata.backing.lunuuid} |Where-Object {("naa." + $_.ExtensionData.Backing.LunUuid.substring(10).substring(0,32)) -eq $newNAA}
+      return $rdmDisk
+  }
+  catch {
+      Write-Error "RDM creation failed; please check VM/array for issues"
+      throw $PSItem
+  }
+}
 function Get-PfaRdmVol {
     <#
     .SYNOPSIS
