@@ -226,6 +226,43 @@ function New-PfaRdm {
         throw $PSItem
     }
 }
+function Add-RDMDisksToOtherClusterNode {
+  <#
+.SYNOPSIS
+  Takes RDMs from source VM and attaches them to target VM (clustered VM setup)
+.DESCRIPTION
+  Gets the RDMs from a source VM shared SCSI controller and attaches them similarly to the target VM
+.INPUTS
+  FlashArray connection, volume name, virtual machine, SCSI adapter.
+.OUTPUTS
+  FlashArray volume name
+.NOTES
+  Version:        2.0
+  Author:         Luke Roberts
+  Creation Date:  06/02/2023
+.EXAMPLE
+  PS C:\ $faCreds = get-credential
+  PS C:\ New-PfaConnection -endpoint flasharray-m20-2 -credentials $faCreds -defaultArray
+  PS C:\ $vm = get-vm myVM
+  PS C:\ New-PfaRDM -vm $vm -volName MYPUREVOLNAME
+
+  Takes RDMs from source VM and attaches them to target VM (clustered VM setup)
+#>
+
+[CmdletBinding()]
+Param(
+        [Parameter(Position=0,mandatory=$true,ValueFromPipeline=$True)]
+        [VMware.VimAutomation.ViCore.Types.V1.Inventory.VirtualMachine]$SourceVM,
+
+        [Parameter(Position=1,mandatory=$true,ValueFromPipeline=$True)]
+        [VMware.VimAutomation.ViCore.Types.V1.Inventory.VirtualMachine]$TargetVM
+)
+
+$SourceDisks = $SourceVM | Get-HardDisk | ?{$_.DiskType -eq "RawPhysical"}
+foreach($sdisk in $SourceDisks){
+  New-HardDisk -ErrorAction Stop -VM $TargetVM -Controller ($TargetVM | Get-ScsiController -Name ($sdisk | Get-ScsiController).Name) -DiskPath $sdisk.Filename
+}
+}
 function Add-PfaExistingVolRdm {
   <#
   .SYNOPSIS
